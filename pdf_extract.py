@@ -2,6 +2,8 @@ import fitz  # PyMuPDF
 import cv2
 import numpy as np
 
+# pip install pdf2image opencv-python numpy
+
 pdf_path = "your_document.pdf"
 page_number = 23  # 1-indexed
 
