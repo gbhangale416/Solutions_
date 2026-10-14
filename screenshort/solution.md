@@ -18,21 +18,57 @@ Keep the existing imports, OCR, rendering, checkbox detection, and label-reading
 
 ```
 
-def locate_question_from_screenshot(
-    page_image,
-    screenshot_path
-):
-    """
-    Locate a question screenshot inside a rendered PDF page
-    using OpenCV template matching.
+import json
+import re
 
-    The screenshot should contain a distinctive portion of
-    the question text, preferably without large margins.
-    """
+import cv2
+import numpy as np
+import pymupdf
+import pytesseract
 
-    screenshot = cv2.imread(screenshot_path)
 
-    if screenshot is None:
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+DPI = 300
+
+# Minimum screenshot matching score.
+MATCH_THRESHOLD = 0.55
+
+# Checkbox detection thresholds need validation on your PDF.
+CHECKED_THRESHOLD = 0.10
+
+
+# =========================================================
+# RENDER PDF PAGE
+# =========================================================
+
+def render_page(page):
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(DPI / 72, DPI / 72),
+        alpha=False
+    )
+
+    image = np.frombuffer(
+        pix.samples, dtype=np.uint8
+    ).reshape(pix.height, pix.width, pix.n)
+
+    return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+
+# =========================================================
+# LOCATE SCREENSHOT ON PDF PAGE
+# =========================================================
+
+def locate_screenshot(page_image, screenshot_path):
+    template = cv2.imread(screenshot_path)
+
+    if template is None:
         raise FileNotFoundError(
             f"Cannot read screenshot: {screenshot_path}"
         )
@@ -40,33 +76,27 @@ def locate_question_from_screenshot(
     page_gray = cv2.cvtColor(
         page_image, cv2.COLOR_BGR2GRAY
     )
-
     template_gray = cv2.cvtColor(
-        screenshot, cv2.COLOR_BGR2GRAY
+        template, cv2.COLOR_BGR2GRAY
     )
 
-    page_height, page_width = page_gray.shape
-    template_height, template_width = template_gray.shape
+    page_h, page_w = page_gray.shape
+    template_h, template_w = template_gray.shape
 
-    # Try several scales because the screenshot and PDF
-    # may have different resolutions.
     best = None
 
+    # Try different sizes because screenshot and PDF
+    # rendering resolutions may differ.
     for scale in np.linspace(0.5, 2.0, 31):
-        new_width = int(template_width * scale)
-        new_height = int(template_height * scale)
+        w = int(template_w * scale)
+        h = int(template_h * scale)
 
-        if (
-            new_width < 10
-            or new_height < 10
-            or new_width > page_width
-            or new_height > page_height
-        ):
+        if w < 10 or h < 10 or w > page_w or h > page_h:
             continue
 
         resized = cv2.resize(
             template_gray,
-            (new_width, new_height),
+            (w, h),
             interpolation=cv2.INTER_AREA
         )
 
@@ -76,35 +106,191 @@ def locate_question_from_screenshot(
             cv2.TM_CCOEFF_NORMED
         )
 
-        _, max_score, _, max_location = (
-            cv2.minMaxLoc(result)
-        )
+        _, score, _, location = cv2.minMaxLoc(result)
 
-        if best is None or max_score > best["score"]:
+        if best is None or score > best["score"]:
             best = {
-                "score": float(max_score),
-                "x": int(max_location[0]),
-                "y": int(max_location[1]),
-                "w": int(new_width),
-                "h": int(new_height)
+                "score": float(score),
+                "x": int(location[0]),
+                "y": int(location[1]),
+                "w": w,
+                "h": h
             }
 
-    if best is None or best["score"] < 0.55:
+    if best is None or best["score"] < MATCH_THRESHOLD:
         raise ValueError(
-            "Could not locate the screenshot on the PDF page. "
-            "Use a clearer crop or a higher-resolution screenshot. "
+            "Screenshot could not be matched reliably. "
             f"Best score: {best['score'] if best else 'N/A'}"
         )
 
-    return {
-        "x1": best["x"],
-        "y1": best["y"],
-        "x2": best["x"] + best["w"],
-        "y2": best["y"] + best["h"],
-        "method": "screenshot_template_matching",
-        "match_score": best["score"]
-    }
+    return best
 
+
+# =========================================================
+# DETECT CHECKBOXES NEAR MATCHED QUESTION
+# =========================================================
+
+def detect_checkboxes(image, match):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    binary = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )[1]
+
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    # Search the matched question row and the area to its right.
+    row_y1 = max(0, match["y"] - 25)
+    row_y2 = min(
+        image.shape[0],
+        match["y"] + match["h"] + 35
+    )
+
+    search_x1 = match["x"]
+    search_x2 = image.shape[1]
+
+    candidates = []
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+
+        if not (10 <= w <= 65 and 10 <= h <= 65):
+            continue
+
+        if not 0.75 <= w / float(h) <= 1.25:
+            continue
+
+        if x < search_x1 or x > search_x2:
+            continue
+
+        center_y = y + h / 2
+
+        if not row_y1 <= center_y <= row_y2:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour, 0.06 * perimeter, True
+        )
+
+        if not 4 <= len(approx) <= 8:
+            continue
+
+        # Measure dark pixels inside the box, excluding borders.
+        mx = max(2, int(w * 0.25))
+        my = max(2, int(h * 0.25))
+
+        interior = binary[
+            y + my:y + h - my,
+            x + mx:x + w - mx
+        ]
+
+        if interior.size == 0:
+            continue
+
+        dark_ratio = float(
+            np.count_nonzero(interior) / interior.size
+        )
+
+        candidates.append({
+            "x": int(x),
+            "y": int(y),
+            "w": int(w),
+            "h": int(h),
+            "dark_ratio": dark_ratio,
+            "checked": bool(
+                dark_ratio > CHECKED_THRESHOLD
+            )
+        })
+
+    # Deduplicate nested contours.
+    candidates.sort(key=lambda b: (b["x"], b["y"]))
+    unique = []
+
+    for box in candidates:
+        duplicate = any(
+            abs(box["x"] - old["x"]) < 4
+            and abs(box["y"] - old["y"]) < 4
+            and abs(box["w"] - old["w"]) < 4
+            and abs(box["h"] - old["h"]) < 4
+            for old in unique
+        )
+
+        if not duplicate:
+            unique.append(box)
+
+    return sorted(unique, key=lambda b: b["x"])
+
+
+# =========================================================
+# READ LABEL TO THE RIGHT OF CHECKBOX
+# =========================================================
+
+def read_label(image, box, next_box=None):
+    height, width = image.shape[:2]
+
+    x1 = box["x"] + box["w"] + 1
+    x2 = (
+        next_box["x"]
+        if next_box
+        else min(width, x1 + 160)
+    )
+
+    padding = max(8, int(box["h"] * 0.6))
+
+    y1 = max(0, box["y"] - padding)
+    y2 = min(height, box["y"] + box["h"] + padding)
+
+    if x2 <= x1:
+        return ""
+
+    crop = image[y1:y2, x1:x2]
+
+    if crop.size == 0:
+        return ""
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    gray = cv2.resize(
+        gray,
+        None,
+        fx=3,
+        fy=3,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    text = pytesseract.image_to_string(
+        gray,
+        config="--psm 7"
+    )
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Recognize common checkbox labels.
+    match = re.match(
+        r"^(Unknown|Yes|No|N/?A|True|False)\b",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1)
+
+    return text.split()[0] if text else ""
+
+
+# =========================================================
+# PUBLIC FUNCTION
+# =========================================================
 
 def get_checked_option(
     pdf_path,
@@ -112,42 +298,30 @@ def get_checked_option(
     question_screenshot
 ):
     """
-    Inputs:
-        pdf_path: Path to the original PDF.
-        page_number: 1-based page number.
-        question_screenshot: Screenshot crop of the question.
-
-    Returns:
-        A JSON-serializable dictionary.
+    page_number is 1-based.
+    question_screenshot is a cropped screenshot of the question.
     """
 
     with pymupdf.open(pdf_path) as pdf:
-
         if not 1 <= page_number <= len(pdf):
             raise ValueError(
-                f"Invalid page {page_number}. "
+                f"Invalid page number {page_number}; "
                 f"PDF has {len(pdf)} pages."
             )
 
         page = pdf[page_number - 1]
         image = render_page(page)
 
-        question_box = locate_question_from_screenshot(
+        match = locate_screenshot(
             image,
             question_screenshot
         )
 
-        # Find checkbox candidates associated with the
-        # matched screenshot area.
-        boxes = detect_checkboxes(
-            image,
-            question_box
-        )
+        boxes = detect_checkboxes(image, match)
 
         if not boxes:
             return {
                 "page_number": page_number,
-                "question_screenshot": question_screenshot,
                 "checked_option": None,
                 "status": "Review required: no checkboxes detected",
                 "options": []
@@ -162,9 +336,7 @@ def get_checked_option(
                 else None
             )
 
-            label = read_option_label(
-                image, box, next_box
-            )
+            label = read_label(image, box, next_box)
 
             options.append({
                 "label": str(label),
@@ -178,36 +350,56 @@ def get_checked_option(
 
         selected = [
             option for option in options
-            if option["checked"]
+            if option["checked"] and option["label"]
         ]
 
-        if len(selected) == 1 and selected[0]["label"]:
+        if len(selected) == 1:
             checked_option = selected[0]["label"]
             status = "OK"
-
         elif len(selected) == 0:
             checked_option = None
             status = "Review required: no checked option detected"
-
         else:
             checked_option = None
-            status = (
-                "Review required: multiple checked boxes "
-                "or missing option labels"
+            status = "Review required: multiple boxes appear checked"
+
+        # Save a diagnostic image with detected boxes.
+        debug = image.copy()
+
+        for box in boxes:
+            color = (
+                (0, 255, 0)
+                if box["checked"]
+                else (0, 0, 255)
             )
+
+            cv2.rectangle(
+                debug,
+                (box["x"], box["y"]),
+                (box["x"] + box["w"], box["y"] + box["h"]),
+                color,
+                2
+            )
+
+        cv2.imwrite(
+            f"debug_page_{page_number}.png",
+            debug
+        )
 
         return {
             "page_number": int(page_number),
-            "question_screenshot": question_screenshot,
+            "screenshot_match_score": float(match["score"]),
             "checked_option": checked_option,
             "status": status,
-            "screenshot_match_score": question_box["match_score"],
             "options": options
         }
 
 
-if __name__ == "__main__":
+# =========================================================
+# EXECUTION
+# =========================================================
 
+if __name__ == "__main__":
     result = get_checked_option(
         pdf_path=r"C:\PDF\Input.pdf",
         page_number=3,
@@ -215,6 +407,7 @@ if __name__ == "__main__":
     )
 
     print(json.dumps(result, indent=4, ensure_ascii=False))
+
 
 ```
 
