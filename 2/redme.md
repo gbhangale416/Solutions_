@@ -17,7 +17,7 @@ Run (no Tesseract needed)
 
 powershell
 pip install pymupdf opencv-python numpy
-python pdf_checkbox_finder.py --pdf "C:/Girishbh/Pdf_extraction/Anderson_Alexandria_....pdf" --page 23 --question "C:/Girishbh/Pdf_extraction/cropped_question.png"
+python pdf_checkbox_finder.py --pdf "C:/Girishbh/Pdf_extraction/gb_....pdf" --page 23 --question "C:/Girishbh/Pdf_extraction/cropped_question.png"
 Choosing a text source with --text-source:
 
 Option	Install	When to use
